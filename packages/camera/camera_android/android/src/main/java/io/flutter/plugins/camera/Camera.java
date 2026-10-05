@@ -117,6 +117,10 @@ class Camera
 
   CameraDeviceWrapper cameraDevice;
   CameraCaptureSession captureSession;
+  // PATCHED (see third_party/camera_android/PATCH_NOTES.md): guards the swap of
+  // captureSession/cameraDevice between the main thread (dispose) and the camera
+  // background thread (callbacks).
+  private final Object sessionLock = new Object();
   @VisibleForTesting ImageReader pictureImageReader;
   ImageStreamReader imageStreamReader;
   /** {@link CaptureRequest.Builder} for the camera preview */
@@ -570,7 +574,8 @@ class Camera
       @Nullable Runnable onSuccessCallback, @NonNull ErrorCallback onErrorCallback) {
     Log.i(TAG, "refreshPreviewCaptureSession");
 
-    if (captureSession == null) {
+    final CameraCaptureSession session = captureSession; // PATCHED: local copy
+    if (session == null) {
       Log.i(
           TAG,
           "refreshPreviewCaptureSession: captureSession not yet initialized, "
@@ -580,7 +585,7 @@ class Camera
 
     try {
       if (!pausedPreview) {
-        captureSession.setRepeatingRequest(
+        session.setRepeatingRequest(
             previewRequestBuilder.build(), cameraCaptureCallback, backgroundHandler);
       }
 
@@ -653,12 +658,18 @@ class Camera
    */
   private void runPrecaptureSequence() {
     Log.i(TAG, "runPrecaptureSequence");
+    // PATCHED: runs on the camera background thread and can race with dispose().
+    final CameraCaptureSession session = captureSession;
+    if (session == null) {
+      Log.i(TAG, "runPrecaptureSequence: captureSession null (camera closing), returning");
+      return;
+    }
     try {
       // First set precapture state to idle or else it can hang in STATE_WAITING_PRECAPTURE_START.
       previewRequestBuilder.set(
           CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER,
           CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE);
-      captureSession.capture(
+      session.capture(
           previewRequestBuilder.build(), cameraCaptureCallback, backgroundHandler);
 
       // Repeating request to refresh preview session.
@@ -674,11 +685,14 @@ class Camera
           CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START);
 
       // Trigger one capture to start AE sequence.
-      captureSession.capture(
+      session.capture(
           previewRequestBuilder.build(), cameraCaptureCallback, backgroundHandler);
 
     } catch (CameraAccessException e) {
       e.printStackTrace();
+    } catch (IllegalStateException e) {
+      // PATCHED: session was closed underneath us (camera disposed mid-capture).
+      Log.w(TAG, "runPrecaptureSequence: camera closed: " + e.getMessage());
     }
   }
 
@@ -690,13 +704,16 @@ class Camera
     Log.i(TAG, "captureStillPicture");
     cameraCaptureCallback.setCameraState(CameraState.STATE_CAPTURING);
 
-    if (cameraDevice == null) {
+    // PATCHED: local copies; this runs on the camera background thread.
+    final CameraDeviceWrapper device = cameraDevice;
+    final CameraCaptureSession session = captureSession;
+    if (device == null || session == null) {
       return;
     }
     // This is the CaptureRequest.Builder that is used to take a picture.
     CaptureRequest.Builder stillBuilder;
     try {
-      stillBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+      stillBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
     } catch (CameraAccessException e) {
       dartMessenger.error(flutterResult, "cameraAccess", e.getMessage(), null);
       return;
@@ -733,9 +750,13 @@ class Camera
 
     try {
       Log.i(TAG, "sending capture request");
-      captureSession.capture(stillBuilder.build(), captureCallback, backgroundHandler);
+      session.capture(stillBuilder.build(), captureCallback, backgroundHandler);
     } catch (CameraAccessException e) {
       dartMessenger.error(flutterResult, "cameraAccess", e.getMessage(), null);
+    } catch (IllegalStateException e) {
+      // PATCHED: camera closed while the still capture was being requested.
+      dartMessenger.error(
+          flutterResult, "cameraAccess", "Camera is closed: " + e.getMessage(), null);
     }
   }
 
@@ -778,8 +799,9 @@ class Camera
 
   private void lockAutoFocus() {
     Log.i(TAG, "lockAutoFocus");
-    if (captureSession == null) {
-      Log.i(TAG, "[unlockAutoFocus] captureSession null, returning");
+    final CameraCaptureSession session = captureSession; // PATCHED: local copy
+    if (session == null) {
+      Log.i(TAG, "[lockAutoFocus] captureSession null, returning");
       return;
     }
 
@@ -788,20 +810,24 @@ class Camera
         CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
 
     try {
-      captureSession.capture(previewRequestBuilder.build(), null, backgroundHandler);
+      session.capture(previewRequestBuilder.build(), null, backgroundHandler);
     } catch (CameraAccessException e) {
       String message =
           (e.getMessage() == null)
               ? "CameraAccessException occurred while locking autofocus."
               : e.getMessage();
       dartMessenger.sendCameraErrorEvent(message);
+    } catch (IllegalStateException e) {
+      // PATCHED: camera closed while locking autofocus.
+      Log.w(TAG, "lockAutoFocus: camera closed: " + e.getMessage());
     }
   }
 
   /** Cancel and reset auto focus state and refresh the preview session. */
   void unlockAutoFocus() {
     Log.i(TAG, "unlockAutoFocus");
-    if (captureSession == null) {
+    final CameraCaptureSession session = captureSession; // PATCHED: local copy
+    if (session == null) {
       Log.i(TAG, "[unlockAutoFocus] captureSession null, returning");
       return;
     }
@@ -809,19 +835,23 @@ class Camera
       // Cancel existing AF state.
       previewRequestBuilder.set(
           CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL);
-      captureSession.capture(previewRequestBuilder.build(), null, backgroundHandler);
+      session.capture(previewRequestBuilder.build(), null, backgroundHandler);
 
       // Set AF state to idle again.
       previewRequestBuilder.set(
           CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE);
 
-      captureSession.capture(previewRequestBuilder.build(), null, backgroundHandler);
+      session.capture(previewRequestBuilder.build(), null, backgroundHandler);
     } catch (CameraAccessException e) {
       String message =
           (e.getMessage() == null)
               ? "CameraAccessException occurred while unlocking autofocus."
               : e.getMessage();
       dartMessenger.sendCameraErrorEvent(message);
+      return;
+    } catch (IllegalStateException e) {
+      // PATCHED: camera closed (e.g. disposed right after takePicture) - nothing left to unlock.
+      Log.w(TAG, "unlockAutoFocus: camera closed: " + e.getMessage());
       return;
     }
 
@@ -1152,8 +1182,13 @@ class Camera
     if (!this.pausedPreview) {
       this.pausedPreview = true;
 
-      if (this.captureSession != null) {
-        this.captureSession.stopRepeating();
+      final CameraCaptureSession session = this.captureSession; // PATCHED: local copy
+      if (session != null) {
+        try {
+          session.stopRepeating();
+        } catch (IllegalStateException e) {
+          Log.w(TAG, "pausePreview: camera closed: " + e.getMessage());
+        }
       }
     }
   }
@@ -1316,11 +1351,21 @@ class Camera
   }
 
   void closeCaptureSession() {
-    if (captureSession != null) {
-      Log.i(TAG, "closeCaptureSession");
-
-      captureSession.close();
+    // PATCHED: read-and-clear in one locked step, then close our own copy. The original
+    // checked captureSession != null and then dereferenced it again, so a concurrent
+    // stopAndReleaseCamera() could null it in between (NullPointerException crash).
+    final CameraCaptureSession session;
+    synchronized (sessionLock) {
+      session = captureSession;
       captureSession = null;
+    }
+    if (session != null) {
+      Log.i(TAG, "closeCaptureSession");
+      try {
+        session.close();
+      } catch (IllegalStateException e) {
+        Log.w(TAG, "closeCaptureSession: session already closed: " + e.getMessage());
+      }
     }
   }
 
@@ -1347,14 +1392,20 @@ class Camera
   }
 
   private void stopAndReleaseCamera() {
-    if (cameraDevice != null) {
-      cameraDevice.close();
+    // PATCHED: swap both references under the lock; do the slow close outside it.
+    final CameraDeviceWrapper device;
+    synchronized (sessionLock) {
+      device = cameraDevice;
       cameraDevice = null;
-
-      // Closing the CameraDevice without closing the CameraCaptureSession is recommended
-      // for quickly closing the camera:
-      // https://developer.android.com/reference/android/hardware/camera2/CameraCaptureSession#close()
-      captureSession = null;
+      if (device != null) {
+        // Closing the CameraDevice without closing the CameraCaptureSession is recommended
+        // for quickly closing the camera:
+        // https://developer.android.com/reference/android/hardware/camera2/CameraCaptureSession#close()
+        captureSession = null;
+      }
+    }
+    if (device != null) {
+      device.close();
     } else {
       closeCaptureSession();
     }
