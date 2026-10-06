@@ -11,6 +11,7 @@ import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
 import android.util.Log;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 import io.flutter.plugins.camera.types.CameraCaptureProperties;
 import io.flutter.plugins.camera.types.CaptureTimeoutsWrapper;
@@ -76,9 +77,20 @@ class CameraCaptureCallback extends CaptureCallback {
     cameraState = state;
   }
 
+  // PATCHED (fast capture): latest CONTROL_AE_STATE seen in any capture result (null = never
+  // reported). Read by Camera.takePicture() to decide whether a flash pre-capture is needed.
+  private volatile Integer lastAeState;
+
+  /** Latest AE state reported by the camera, or null if the device never reports one. */
+  @Nullable
+  public Integer getLastAeState() {
+    return lastAeState;
+  }
+
   private void process(CaptureResult result) {
     Integer aeState = result.get(aeStateKey);
     Integer afState = result.get(afStateKey);
+    lastAeState = aeState; // PATCHED (fast capture)
 
     // Update capture properties
     if (result instanceof TotalCaptureResult) {

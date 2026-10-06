@@ -653,7 +653,26 @@ class Camera
     // captureTimeouts (3 s) and on some devices (e.g. Samsung Galaxy M21) the AF never reports
     // LOCKED, so every capture paid the full timeout. Callers validate the picture afterwards.
     if (CAPTURE_WITHOUT_AF_LOCK) {
-      takePictureAfterPrecapture();
+      // The AE precapture sequence is what lets a flash be metered, so keep it only when a flash
+      // may actually fire: flash "always", or flash "auto" while the camera reports
+      // FLASH_REQUIRED (dark scene) or has not reported an AE state (unknown -> be safe).
+      // Flash off/torch/unsupported (e.g. most front cameras), or a lit scene: capture at once.
+      final FlashFeature flashFeature = cameraFeatures.getFlash();
+      boolean precaptureForFlash = false;
+      if (flashFeature.checkIsSupported()) {
+        final FlashMode flashMode = flashFeature.getValue();
+        final Integer aeState = cameraCaptureCallback.getLastAeState();
+        precaptureForFlash =
+            flashMode == FlashMode.always
+                || (flashMode == FlashMode.auto
+                    && (aeState == null
+                        || aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED));
+      }
+      if (precaptureForFlash) {
+        runPrecaptureSequence();
+      } else {
+        takePictureAfterPrecapture();
+      }
       return;
     }
 
