@@ -121,6 +121,10 @@ class Camera
   // captureSession/cameraDevice between the main thread (dispose) and the camera
   // background thread (callbacks).
   private final Object sessionLock = new Object();
+
+  // PATCHED (fast capture): see takePicture(). Set to false to restore the upstream
+  // AF-lock + precapture sequence before every still capture.
+  private static final boolean CAPTURE_WITHOUT_AF_LOCK = true;
   @VisibleForTesting ImageReader pictureImageReader;
   ImageStreamReader imageStreamReader;
   /** {@link CaptureRequest.Builder} for the camera preview */
@@ -642,6 +646,16 @@ class Camera
 
     // Listen for picture being taken.
     pictureImageReader.setOnImageAvailableListener(this, backgroundHandler);
+
+    // PATCHED (fast capture): take the still immediately. The preview request already runs
+    // continuous AF/AE (CONTROL_AF_MODE_CONTINUOUS_PICTURE), so the explicit "lock autofocus, then
+    // run the AE precapture sequence" steps below only add latency: each may wait up to
+    // captureTimeouts (3 s) and on some devices (e.g. Samsung Galaxy M21) the AF never reports
+    // LOCKED, so every capture paid the full timeout. Callers validate the picture afterwards.
+    if (CAPTURE_WITHOUT_AF_LOCK) {
+      takePictureAfterPrecapture();
+      return;
+    }
 
     final AutoFocusFeature autoFocusFeature = cameraFeatures.getAutoFocus();
     final boolean isAutoFocusSupported = autoFocusFeature.checkIsSupported();
